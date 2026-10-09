@@ -1,0 +1,354 @@
+"""Reproducible packet-level AMARL revision.
+
+Time is seconds; capacity is bits/s. Independent FIFO output queues per directed
+link. Control and data packets share capacity and buffer space. No MAC, wireless
+interference, retransmission, energy model or physical quantum model is claimed.
+Run: python amarl_routing_revised.py --output results
+"""
+from __future__ import annotations
+import argparse, csv, heapq, json, math, random
+from bisect import bisect_right
+from collections import defaultdict, deque
+from dataclasses import dataclass, asdict
+from pathlib import Path
+import networkx as nx
+import numpy as np
+
+@dataclass
+class Config:
+    nodes: int = 20
+    topology: str = 'random'
+    duration: float = 12.0
+    train_duration: float = 8.0
+    drain: float = 2.0
+    rate: float = 300.0
+    capacity: float = 500000.0
+    queue_limit: int = 16
+    packet_bytes: int = 512
+    window: float = 0.5
+    advertise: float = 0.25
+    failure_fraction: float = 0.1
+    physical_loss: float = 0.01
+    eta: float = 0.1
+    discount: float = 0.9
+    epsilon: float = 0.15
+    ttl: int = 32
+    seed: int = 0
+
+@dataclass
+class Packet:
+    kind: str
+    src: int
+    dst: int
+    size: int
+    born: float
+    pid: int = -1
+    hops: int = 0
+    fidelity: float = 1.0
+    payload: object = None
+    cohort: bool = False
+    pending: object = None
+
+class Link:
+    def __init__(self, capacity, propagation, fidelity):
+        self.capacity, self.propagation, self.fidelity = capacity, propagation, fidelity
+        self.queue = deque()
+        self.busy = False
+        self.failed = False
+        self.samples = deque()  # completed service duration, outcome and latency
+        self.busy_intervals = deque()
+
+class Simulation:
+    def __init__(self, cfg, method):
+        self.cfg, self.method = cfg, method
+        self.rng = random.Random(cfg.seed + 90001)  # exploration only
+        self.time, self.serial, self.events = 0.0, 0, []
+        n = cfg.nodes
+        if n < 4:
+            raise ValueError('Use at least four nodes')
+        if cfg.topology == 'grid':
+            side = math.ceil(math.sqrt(n))
+            self.graph = nx.convert_node_labels_to_integers(nx.grid_2d_graph(side, side))
+            self.graph.remove_nodes_from(range(n, side * side))
+        else:
+            self.graph = nx.connected_watts_strogatz_graph(n, min(4, n-1)//2*2, .3, seed=cfg.seed)
+        r = random.Random(cfg.seed)
+        self.links = {}
+        self.observation_cache = {}
+        for u, v in sorted(self.graph.edges()):
+            cap = cfg.capacity * r.uniform(.8, 1.2)
+            delay = r.uniform(.002, .006)
+            fid = r.uniform(.90, .99)
+            self.links[u,v] = Link(cap, delay, fid)
+            self.links[v,u] = Link(cap, delay, fid)
+        self.neighbors = {u: sorted(self.graph.neighbors(u)) for u in self.graph}
+        self.dv = {u: {u: 0} for u in self.graph}
+        self.cache = {u: {} for u in self.graph}
+        self.Q = defaultdict(float)
+        self.sent, self.delivered, self.data_tx = 0, 0, 0
+        self.ctrl_tx, self.ctrl_bytes, self.data_bytes = 0, 0, 0
+        self.control_types = defaultdict(int)
+        self.delays, self.fidelities, self.rewards = [], [], []
+        self.dropped = defaultdict(int)
+        self.history = []
+        self.static = dict(nx.all_pairs_shortest_path(self.graph))
+        self.failed_edges = r.sample(sorted(self.graph.edges()), min(len(self.graph.edges()), round(len(self.graph.edges())*cfg.failure_fraction)))
+        # Shared, exogenous arrival trace, independent of policy random numbers.
+        r = random.Random(cfg.seed + 1000)
+        t, pid = 1.0, 0
+        while True:
+            multiplier = 1.0 if t < cfg.duration/2 else 1.5
+            t += r.expovariate(cfg.rate * multiplier)
+            if t >= cfg.duration: break
+            s, d = r.sample(range(n), 2)
+            self.schedule(t, 'generate', (s,d,pid)); pid += 1
+        self.schedule(0.0, 'advertise', None)
+        self.schedule(cfg.duration*.55, 'failure', True)
+        self.schedule(cfg.duration*.75, 'failure', False)
+
+    def schedule(self, t, kind, value):
+        self.serial += 1
+        heapq.heappush(self.events, (t, self.serial, kind, value))
+
+    def observe(self, u, v):
+        """Local interface statistics, never global graph observations."""
+        cached = self.observation_cache.get((u,v))
+        if cached is not None and cached[0] == self.time and cached[1][5] == self.links[u,v].failed: return cached[1]
+        L = self.links[u,v]
+        start = self.time - self.cfg.window
+        while L.samples and L.samples[0][0] < start: L.samples.popleft()
+        while L.busy_intervals and L.busy_intervals[0][1] <= start: L.busy_intervals.popleft()
+        busy = sum(max(0.0, min(b,self.time)-max(a,start)) for a,b in L.busy_intervals)
+        util = min(1.0, busy/self.cfg.window)
+        successful = [x[3] for x in L.samples if x[2]]
+        latency = sum(successful)/len(successful) if successful else L.propagation + self.cfg.packet_bytes*8/L.capacity
+        loss = sum(not x[2] for x in L.samples)/len(L.samples) if L.samples else 0.0
+        congestion = len(L.queue)/self.cfg.queue_limit
+        result=(latency, L.capacity*(1-util), congestion, loss, L.fidelity, L.failed)
+        self.observation_cache[u,v]=(self.time,result)
+        return result
+
+    @staticmethod
+    def bin_state(obs):
+        l,b,c,p,f,failed = obs
+        # Distinct ranges; unlike the original, loss bins resolve small losses.
+        return tuple(bisect_right(edges,x) for x,edges in zip(
+            (l,b,c,p,f), ([.005,.02,.05,.1],[50000,150000,300000,500000],[.1,.3,.6,.9],[.005,.02,.05,.15],[.90,.93,.96,.98])))
+
+    def state(self,u,v,d):
+        obs = self.observe(u,v)
+        nb = self.cache[u].get(v)
+        nc = 0.0
+        if self.method == 'AMARL' and nb and self.time-nb[0] <= 3*self.cfg.advertise:
+            nc = nb[2]
+        return (d, v, self.bin_state(obs), int(nc*4))
+
+    def choices(self,u,d):
+        options=[]
+        current = self.dv[u].get(d, math.inf)
+        for v in self.neighbors[u]:
+            if self.observe(u,v)[5]: continue
+            info = self.cache[u].get(v)
+            if info and self.time-info[0] <= 3*self.cfg.advertise and info[1].get(d,math.inf) < current:
+                options.append(v)
+        return options
+
+    def value(self,u,v,d):
+        return self.Q[(u,self.state(u,v,d))]
+
+    def learn(self, pending, cost, next_node, d, terminal=False):
+        if pending is None or self.time >= self.cfg.train_duration: return
+        u,key = pending
+        opts = [] if terminal else self.choices(next_node,d)
+        future = min((self.value(next_node,v,d) for v in opts), default=0.0)
+        self.apply_feedback(pending,cost,future)
+
+    def apply_feedback(self,pending,cost,future):
+        if pending is None or self.time >= self.cfg.train_duration: return
+        u,key=pending
+        old=self.Q[u,key]
+        self.Q[u,key]=old+self.cfg.eta*(cost+self.cfg.discount*future-old)
+        self.rewards.append(-cost)
+
+    def choose(self,u,d):
+        if self.method == 'Static shortest path':
+            path = self.static.get(u,{}).get(d)
+            return path[1] if path and len(path)>1 else None
+        opts = self.choices(u,d)
+        if not opts: return None
+        if self.method == 'Distance vector':
+            return min(opts,key=lambda v:(self.cache[u][v][1].get(d,math.inf),v))
+        if self.time < self.cfg.train_duration and self.rng.random()<self.cfg.epsilon:
+            return self.rng.choice(opts)
+        # Random ties avoid consistently favoring a particular neighbor ID.
+        vals = [(self.value(u,v,d), self.rng.random(), v) for v in opts]
+        return min(vals)[2]
+
+    def send(self,u,v,p):
+        L = self.links[u,v]
+        self.observation_cache.pop((u,v),None)
+        if L.failed or len(L.queue)>=self.cfg.queue_limit:
+            # Immediate local enqueue failures are included in interface outcomes.
+            L.samples.append((self.time,0.0,False,0.0))
+            if p.kind=='data':
+                self.learn(p.pending,2.0,v,p.dst,True)
+                if p.cohort: self.dropped['link_down' if L.failed else 'queue_full'] += 1
+            return
+        L.queue.append((p,self.time))
+        if not L.busy: self.start(u,v)
+
+    def start(self,u,v):
+        L = self.links[u,v]
+        self.observation_cache.pop((u,v),None)
+        if not L.queue: L.busy=False; return
+        L.busy=True
+        p,enqueued=L.queue[0]
+        service=p.size*8/L.capacity
+        L.busy_intervals.append((self.time,self.time+service))
+        # Count actual on-link transmission attempts, including failed ones.
+        if p.kind=='control':
+            if self.cfg.train_duration <= self.time < self.cfg.duration:
+                self.ctrl_tx+=1; self.ctrl_bytes+=p.size
+                self.control_types[p.payload[0]]+=1
+        elif p.cohort:
+            self.data_tx+=1; self.data_bytes+=p.size
+        self.schedule(self.time+service,'service',(u,v,p,enqueued))
+
+    def forward(self,u,p):
+        if u==p.dst:
+            if p.cohort:
+                self.delivered+=1; self.delays.append(self.time-p.born); self.fidelities.append(p.fidelity)
+            return
+        if p.hops>=self.cfg.ttl:
+            if p.cohort: self.dropped['ttl']+=1
+            return
+        v=self.choose(u,p.dst)
+        if v is None:
+            if p.cohort: self.dropped['no_route']+=1
+            return
+        key = self.state(u,v,p.dst) if self.method in ('AMARL','Independent Q routing') else None
+        p.pending=(u,key) if key is not None else None
+        p.hops+=1
+        self.send(u,v,p)
+
+    def advertise(self):
+        if self.method != 'Static shortest path':
+            # Rebuild from fresh advertisements, allowing withdrawals/recovery.
+            for u in self.graph:
+                table={u:0}
+                for v,(timestamp,dist,nc) in list(self.cache[u].items()):
+                    if self.time-timestamp > 3*self.cfg.advertise or self.links[u,v].failed: continue
+                    for d,h in dist.items():
+                        if h+1 < self.cfg.nodes: table[d]=min(table.get(d,math.inf),h+1)
+                self.dv[u]=table
+            for u in self.graph:
+                obs=[self.observe(u,v) for v in self.neighbors[u]]
+                nc = max((x[2] for x in obs), default=0.0)
+                for v in self.neighbors[u]:
+                    if self.links[u,v].failed: continue
+                    # Explicit serialized size model, hop count entries and health.
+                    size=24+8*len(self.dv[u])+(16 if self.method=='AMARL' else 0)
+                    payload=("advertisement",dict(self.dv[u]),nc if self.method=='AMARL' else 0.0)
+                    self.send(u,v,Packet('control',u,v,size,self.time,payload=payload))
+        if self.time+self.cfg.advertise < self.cfg.duration:
+            self.schedule(self.time+self.cfg.advertise,'advertise',None)
+
+    def run(self):
+        while self.events:
+            self.time,_,kind,arg=heapq.heappop(self.events)
+            if self.time>self.cfg.duration+self.cfg.drain: break
+            if kind=='generate':
+                s,d,pid=arg
+                cohort=self.time>=self.cfg.train_duration
+                if cohort:self.sent+=1
+                self.forward(s,Packet('data',s,d,self.cfg.packet_bytes,self.time,pid=pid,cohort=cohort))
+            elif kind=='advertise': self.advertise()
+            elif kind=='failure':
+                self.observation_cache.clear()
+                for u,v in self.failed_edges:
+                    self.links[u,v].failed=arg; self.links[v,u].failed=arg
+            elif kind=='service':
+                u,v,p,enqueued=arg; L=self.links[u,v]
+                self.observation_cache.pop((u,v),None)
+                L.queue.popleft()
+                # Shared deterministic channel draw indexed by packet and hop.
+                token=(self.cfg.seed+1)*1000003+(p.pid+2)*9176+u*131+v*17+p.hops
+                if p.kind == "control": token += round(p.born*1000000)
+                loss=random.Random(token).random()<self.cfg.physical_loss
+                ok=not L.failed and not loss
+                L.samples.append((self.time,self.time-enqueued,ok,self.time-enqueued+L.propagation))
+                if ok:
+                    p.fidelity=min(p.fidelity,L.fidelity)
+                    self.schedule(self.time+L.propagation,'arrival',(u,v,p,enqueued))
+                elif p.kind=='data':
+                    self.learn(p.pending,2.0,v,p.dst,True)
+                    if p.cohort:self.dropped['transmission']+=1
+                self.start(u,v)
+            elif kind=='arrival':
+                u,v,p,enqueued=arg
+                if p.kind=='control':
+                    if p.payload[0]=="advertisement":
+                        _,dist,nc=p.payload; self.cache[v][u]=(self.time,dist,nc)
+                    else:
+                        _,pending,cost,future=p.payload
+                        self.apply_feedback(pending,cost,future)
+                else:
+                    # One-hop measured delay, successful outcome and synthetic fidelity.
+                    cost=(self.time-enqueued)/.05 + .1*(1-self.links[u,v].fidelity)
+                    if p.pending is not None and self.time < self.cfg.train_duration:
+                        opts=[] if v==p.dst else self.choices(v,p.dst)
+                        future=min((self.value(v,a,p.dst) for a in opts),default=0.0)
+                        payload=("feedback",p.pending,cost,future)
+                        self.send(v,u,Packet("control",v,u,48,self.time,payload=payload))
+                    p.pending=None
+                    self.forward(v,p)
+        unfinished=self.sent-self.delivered-sum(self.dropped.values())
+        if unfinished: self.dropped["drain_deadline"]+=unfinished
+        elapsed=self.cfg.duration-self.cfg.train_duration
+        return dict(method=self.method,seed=self.cfg.seed,nodes=self.cfg.nodes,rate=self.cfg.rate,topology=self.cfg.topology,
+                    generated=self.sent,delivered=self.delivered,pdr_pct=100*self.delivered/max(1,self.sent),
+                    loss_pct=100*(self.sent-self.delivered)/max(1,self.sent),
+                    delay_ms=1000*np.mean(self.delays) if self.delays else float('nan'),
+                    goodput_mbps=self.delivered*self.cfg.packet_bytes*8/elapsed/1e6,
+                    control_transmissions=self.ctrl_tx,data_transmissions=self.data_tx,
+                    control_bytes=self.ctrl_bytes,nrl=self.ctrl_tx/max(1,self.delivered),
+                    # Signaling attempts counted only within the evaluation time interval.
+                    fidelity_proxy=np.mean(self.fidelities) if self.fidelities else float('nan'),
+                    q_entries=len(self.Q),control_types=json.dumps(dict(self.control_types),sort_keys=True),drop_counts=json.dumps(dict(self.dropped),sort_keys=True))
+
+METHODS=['Static shortest path','Distance vector','Independent Q routing','AMARL']
+
+def experiment(output, seeds=5, duration=30.0):
+    if seeds < 1 or duration <= 1: raise ValueError("At least one seed and duration greater than one second are required")
+    out=Path(output);out.mkdir(parents=True,exist_ok=True)
+    rows=[]
+    for nodes in (10,20,30):
+        for rate in (300.0,1500.0):
+            for seed in range(seeds):
+                for method in METHODS:
+                    cfg=Config(nodes=nodes,rate=rate,seed=seed,duration=duration,train_duration=duration*2/3)
+                    row=Simulation(cfg,method).run();rows.append(row)
+            print(f'Completed nodes={nodes} rate={rate}',flush=True)
+    with (out/'raw_results.csv').open('w',newline='') as f:
+        w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
+    metrics=['pdr_pct','loss_pct','delay_ms','goodput_mbps','nrl','control_transmissions','fidelity_proxy']
+    summary=[]
+    for nodes in (10,20,30):
+        for rate in (300.0,1500.0):
+            for method in METHODS:
+                selected=[r for r in rows if r['nodes']==nodes and r['rate']==rate and r['method']==method]
+                s=dict(nodes=nodes,rate=rate,method=method,runs=len(selected))
+                for metric in metrics:
+                    values=np.array([r[metric] for r in selected],dtype=float)
+                    s[metric+'_mean']=float(np.nanmean(values))
+                    s[metric+'_sd']=float(np.nanstd(values,ddof=1)) if len(values)>1 else 0.0
+                summary.append(s)
+    with (out/'summary.csv').open('w',newline='') as f:
+        w=csv.DictWriter(f,fieldnames=list(summary[0]));w.writeheader();w.writerows(summary)
+    cfg=asdict(Config(duration=duration,train_duration=duration*2/3))
+    (out/'configuration.json').write_text(json.dumps(dict(defaults=cfg,seeds=list(range(seeds)),sizes=[10,20,30],rates=[300,1500],methods=METHODS),indent=2))
+    return rows,summary
+
+if __name__=='__main__':
+    ap=argparse.ArgumentParser();ap.add_argument('--output',default='results');ap.add_argument('--seeds',type=int,default=5);ap.add_argument('--duration',type=float,default=30)
+    a=ap.parse_args();experiment(a.output,a.seeds,a.duration)
